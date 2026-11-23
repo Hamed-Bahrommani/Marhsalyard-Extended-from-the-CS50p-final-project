@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath, PureWindowsPath
 import tomllib
 
+from marshalyard.canonical import compute_config_hash, containing_root
 from marshalyard.models import (
     MODIFIED_FORMAT_RE,
     AbsPath,
@@ -21,6 +22,10 @@ from marshalyard.models import (
     Token,
     Issue,
     Severity,
+    ValidationResult,
+    Config,
+    Timezone,
+    Rule,
 )
 
 
@@ -343,6 +348,7 @@ class _Sink:
     def __init__(self) -> None:
         self._issues: list[Issue] = []
         self._overflow = False
+        self.has_error = False
 
     def add(
         self,
@@ -353,6 +359,8 @@ class _Sink:
         line: int | None = None,
         column: int | None = None,
     ) -> None:
+        if severity is Severity.ERROR:
+            self.has_error = True
         if len(self._issues) >= MAX_ISSUES:
             self._overflow = True
             return
@@ -464,13 +472,8 @@ def _check_rules(sink: _Sink, data: dict) -> None:
         _check_field(sink, rule, "min_age", base, "string")
 
 
-def check_structure(text: str) -> tuple[Issue, ...]:
-    """TOML syntax, version, unknown keys, types and missing keys.
-
-    Stops after a syntax error or a bad/missing version; otherwise accumulates.
-    Values are not interpreted here (paths, durations, names: next step).
-    """
-    sink = _Sink()
+def _structure(text: str, sink: _Sink) -> dict | None:
+    """S1-S3. Returns the parsed table, or None if parsing must stop."""
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
@@ -483,18 +486,364 @@ def check_structure(text: str) -> tuple[Issue, ...]:
             line=line if _is_plain_int(line) else None,
             column=column if _is_plain_int(column) else None,
         )
-        return sink.finish()
+        return None
 
     if "version" not in data:
         sink.add("VERSION_MISSING", "version", "'version' is required; this tool supports version = 1")
-        return sink.finish()
+        return None
     version = data["version"]
     if not _is_plain_int(version) or version != SUPPORTED_VERSION:
         sink.add("VERSION_UNSUPPORTED", "version", f"unsupported version {version!r}; supported: {SUPPORTED_VERSION}")
-        return sink.finish()
+        return None
 
     _check_unknown(sink, data, _TOP_KEYS, "")
     _check_settings(sink, data)
     _check_rules(sink, data)
+    return data
+
+
+def check_structure(text: str) -> tuple[Issue, ...]:
+    sink = _Sink()
+    _structure(text, sink)
     return sink.finish()
+
+# ---------------------------------------------------------------- value checks and assembly (S3 values, S4)
+
+BUILTIN_EXCLUDES = ("*.part", "*.crdownload", "*.tmp", "desktop.ini", ".*")
+MAX_ROOTS = 20
+MAX_OPERATIONS_LIMIT = 100000
+DEFAULT_MAX_OPERATIONS = 2000
+DEFAULT_MIN_AGE = "10m"
+
+
+def _report(sink: _Sink, exc: FieldError, location: str, code: str | None = None) -> None:
+    detail = getattr(exc, "message", None) or str(exc) or "invalid value"
+    sink.add(code or exc.code, location, f"{location}: {detail}")
+
+
+def _opt_str(table: dict, key: str) -> str | None:
+    value = table.get(key)
+    return value if isinstance(value, str) else None
+
+
+def _opt_strs(table: dict, key: str) -> list[str] | None:
+    value = table.get(key)
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return value
+    return None
+
+
+def _read_roots(sink: _Sink, raw_roots: list[str], flavor: Flavor, home: AbsPath) -> tuple[list[AbsPath], bool]:
+    if not raw_roots:
+        sink.add("ROOTS_EMPTY", "settings.roots", "at least one root is required")
+        return [], False
+    if len(raw_roots) > MAX_ROOTS:
+        sink.add("ROOTS_TOO_MANY", "settings.roots", f"at most {MAX_ROOTS} roots are allowed, found {len(raw_roots)}")
+    roots: list[AbsPath] = []
+    clean = True
+    for index, raw in enumerate(raw_roots):
+        location = f"settings.roots[{index}]"
+        try:
+            path = parse_path(raw, flavor, home)
+        except FieldError as exc:
+            _report(sink, exc, location)
+            clean = False
+            continue
+        if len(path.parts) == 1 or path == home or home.is_relative_to(path):
+            sink.add("ROOT_TOO_BROAD", location, f"{location}: a root may not be a filesystem root, the home directory, or its ancestor")
+        if path in roots:
+            sink.add("ROOT_DUPLICATE", location, f"{location}: duplicate root")
+            clean = False
+            continue
+        roots.append(path)
+    return roots, clean
+
+
+def _read_settings(sink: _Sink, data: dict, flavor: Flavor, home: AbsPath) -> dict:
+    out: dict = {
+        "roots": [],
+        "roots_clean": False,
+        "timezone": None,
+        "min_age_s": None,
+        "max_operations": None,
+        "exclude": None,
+    }
+    settings = data.get("settings")
+    if not isinstance(settings, dict):
+        return out
+
+    raw_roots = _opt_strs(settings, "roots")
+    if raw_roots is not None:
+        out["roots"], out["roots_clean"] = _read_roots(sink, raw_roots, flavor, home)
+
+    if "timezone" in settings:
+        value = _opt_str(settings, "timezone")
+        if value is not None:
+            try:
+                out["timezone"] = Timezone(value)
+            except ValueError:
+                sink.add("TIMEZONE_INVALID", "settings.timezone", "settings.timezone must be 'local' or 'utc'")
+    else:
+        out["timezone"] = Timezone("local")
+
+    min_age = settings.get("min_age", DEFAULT_MIN_AGE)
+    if isinstance(min_age, str):
+        try:
+            out["min_age_s"] = parse_duration(min_age)
+        except FieldError as exc:
+            _report(sink, exc, "settings.min_age")
+
+    if "max_operations" in settings:
+        value = settings["max_operations"]
+        if _is_plain_int(value):
+            if 1 <= value <= MAX_OPERATIONS_LIMIT:
+                out["max_operations"] = value
+            else:
+                sink.add(
+                    "MAX_OPERATIONS_OUT_OF_RANGE",
+                    "settings.max_operations",
+                    f"settings.max_operations must be between 1 and {MAX_OPERATIONS_LIMIT}",
+                )
+    else:
+        out["max_operations"] = DEFAULT_MAX_OPERATIONS
+
+    if "exclude" in settings:
+        patterns = _opt_strs(settings, "exclude")
+        if patterns is not None:
+            good: list[str] = []
+            for index, pattern in enumerate(patterns):
+                try:
+                    good.append(check_glob(pattern, code="EXCLUDE_PATTERN_INVALID"))
+                except FieldError as exc:
+                    _report(sink, exc, f"settings.exclude[{index}]", "EXCLUDE_PATTERN_INVALID")
+            if len(good) == len(patterns):
+                out["exclude"] = good
+    else:
+        out["exclude"] = []
+    return out
+
+
+def _check_destination_components(sink: _Sink, template: DestinationTemplate, root: AbsPath, location: str) -> bool:
+    literals = list(template.base.parts[len(root.parts) :])
+    for component in template.components:
+        if len(component) == 1 and isinstance(component[0], TextToken):
+            literals.append(component[0].text)
+    for literal in literals:
+        try:
+            check_portable_component(literal)
+        except FieldError as exc:
+            _report(sink, exc, location, "TEMPLATE_COMPONENT_INVALID")
+            return False
+    return True
+
+
+def _read_rules(sink: _Sink, data: dict, flavor: Flavor, home: AbsPath, settings: dict) -> list[tuple[int, Rule]]:
+    raw_rules = data.get("rule")
+    if not isinstance(raw_rules, list):
+        return []
+    roots: list[AbsPath] = settings["roots"]
+    roots_clean: bool = settings["roots_clean"]
+    default_min_age = settings["min_age_s"]
+    seen_names: set[str] = set()
+    built: list[tuple[int, Rule]] = []
+
+    for index, raw in enumerate(raw_rules):
+        if not isinstance(raw, dict):
+            continue
+        base = f"rule[{index}]"
+        ok = True
+
+        # name
+        name = None
+        value = _opt_str(raw, "name")
+        if value is None:
+            ok = False
+        else:
+            try:
+                name = check_rule_name(value)
+            except FieldError as exc:
+                _report(sink, exc, f"{base}.name", "RULE_NAME_INVALID")
+                ok = False
+            else:
+                if name in seen_names:
+                    sink.add("RULE_NAME_DUPLICATE", f"{base}.name", f"{base}.name: duplicate rule name '{name}'")
+                    ok = False
+                seen_names.add(name)
+
+        # source
+        source = None
+        value = _opt_str(raw, "source")
+        if value is None:
+            ok = False
+        else:
+            try:
+                source = parse_path(value, flavor, home)
+            except FieldError as exc:
+                _report(sink, exc, f"{base}.source")
+                ok = False
+            else:
+                if roots_clean and containing_root(source, roots) is None:
+                    sink.add("RULE_SOURCE_OUTSIDE_ROOTS", f"{base}.source", f"{base}.source: not inside any root")
+                    ok = False
+
+        # extensions and glob
+        condition_unknown = False
+        extensions: tuple[str, ...] = ()
+        raw_extension_count = 0
+        if "extensions" in raw:
+            items = _opt_strs(raw, "extensions")
+            if items is None:
+                ok = False
+                condition_unknown = True
+            else:
+                raw_extension_count = len(items)
+                good_extensions: list[str] = []
+                for position, item in enumerate(items):
+                    try:
+                        good_extensions.append(normalise_extension(item))
+                    except FieldError as exc:
+                        _report(sink, exc, f"{base}.extensions[{position}]", "EXTENSION_INVALID")
+                        ok = False
+                extensions = dedupe(good_extensions)
+
+        name_glob = None
+        glob_present = "name_glob" in raw
+        if glob_present:
+            value = _opt_str(raw, "name_glob")
+            if value is None:
+                ok = False
+                condition_unknown = True
+            else:
+                try:
+                    name_glob = check_glob(value)
+                except FieldError as exc:
+                    _report(sink, exc, f"{base}.name_glob")
+                    ok = False
+
+        if not condition_unknown and raw_extension_count == 0 and not glob_present:
+            sink.add("RULE_NO_CONDITION", base, f"{base}: needs 'extensions' or 'name_glob'")
+            ok = False
+
+        # min_age
+        min_age_s = None
+        if "min_age" in raw:
+            value = _opt_str(raw, "min_age")
+            if value is None:
+                ok = False
+            else:
+                try:
+                    min_age_s = parse_duration(value)
+                except FieldError as exc:
+                    _report(sink, exc, f"{base}.min_age")
+                    ok = False
+        else:
+            min_age_s = default_min_age
+            if min_age_s is None:
+                ok = False
+
+        # destination
+        template = None
+        value = _opt_str(raw, "destination")
+        if value is None:
+            ok = False
+        else:
+            try:
+                template = parse_template(value, flavor, home)
+            except FieldError as exc:
+                _report(sink, exc, f"{base}.destination")
+                ok = False
+            else:
+                location = f"{base}.destination"
+                if roots_clean:
+                    root = containing_root(template.base, roots)
+                    if root is None:
+                        sink.add("RULE_DESTINATION_OUTSIDE_ROOTS", location, f"{location}: not inside any root")
+                        ok = False
+                    elif not _check_destination_components(sink, template, root, location):
+                        ok = False
+                if source is not None and not template.components and template.base == source:
+                    sink.add("RULE_DESTINATION_IS_SOURCE", location, f"{location}: destination equals the rule's own source")
+                    ok = False
+
+        if ok:
+            built.append((index, Rule(name, source, extensions, name_glob, min_age_s, template)))
+    return built
+
+
+def _cross_check(sink: _Sink, built: list[tuple[int, Rule]]) -> None:
+    for position, (j, later) in enumerate(built):
+        for _, earlier in built[:position]:
+            if (
+                earlier.source == later.source
+                and earlier.name_glob is None
+                and later.name_glob is None
+                and set(earlier.extensions) & set(later.extensions)
+            ):
+                sink.add(
+                    "RULE_OVERLAP",
+                    f"rule[{j}]",
+                    f"rule[{j}]: rules '{earlier.name}' and '{later.name}' match the same files",
+                )
+
+    for i, first in built:
+        template = first.destination
+        if template.components:
+            continue
+        for j, second in built:
+            if i == j or template.base != second.source:
+                continue
+            provably_disjoint = (
+                bool(first.extensions)
+                and bool(second.extensions)
+                and not (set(first.extensions) & set(second.extensions))
+            )
+            if not provably_disjoint:
+                sink.add(
+                    "RULE_CHAIN",
+                    f"rule[{i}].destination",
+                    f"rule[{i}].destination: files moved here may be picked up by rule '{second.name}' on a later run",
+                    Severity.WARNING,
+                )
+
+
+def parse_config(text: str, flavor: Flavor, home: AbsPath) -> ValidationResult:
+    """Pure: configuration text in, a Config or accumulated Issues out."""
+    sink = _Sink()
+    data = _structure(text, sink)
+    if data is None:
+        return ValidationResult(None, sink.finish())
+
+    settings = _read_settings(sink, data, flavor, home)
+    built = _read_rules(sink, data, flavor, home, settings)
+    _cross_check(sink, built)
+
+    issues = sink.finish()
+    if sink.has_error:
+        return ValidationResult(None, issues)
+
+    rules = tuple(rule for _, rule in built)
+    exclude = dedupe(BUILTIN_EXCLUDES + tuple(settings["exclude"]))
+    roots = tuple(settings["roots"])
+    config_hash = compute_config_hash(
+        version=SUPPORTED_VERSION,
+        flavor=flavor,
+        roots=roots,
+        timezone=settings["timezone"],
+        default_min_age_s=settings["min_age_s"],
+        max_operations=settings["max_operations"],
+        exclude=exclude,
+        rules=rules,
+    )
+    config = Config(
+        version=SUPPORTED_VERSION,
+        flavor=flavor,
+        roots=roots,
+        timezone=settings["timezone"],
+        default_min_age_s=settings["min_age_s"],
+        max_operations=settings["max_operations"],
+        exclude=exclude,
+        rules=rules,
+        config_hash=config_hash,
+    )
+    return ValidationResult(config, issues)
 

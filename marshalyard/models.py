@@ -271,3 +271,77 @@ class Issue:
         _require(isinstance(self.severity, Severity), "Issue.severity must be a Severity")
         for value in (self.line, self.column):
             _require(value is None or (_is_int(value) and value >= 1), "Issue.line/column must be None or >= 1")
+
+
+
+# ---------------------------------------------------------------- rules and config
+
+
+@dataclass(frozen=True, slots=True)
+class Rule:
+    name: str
+    source: AbsPath
+    extensions: tuple[str, ...]
+    name_glob: str | None
+    min_age_s: int
+    destination: DestinationTemplate
+
+    def __post_init__(self) -> None:
+        _require(isinstance(self.name, str) and self.name != "", "Rule.name must be a non-empty string")
+        _require(
+            isinstance(self.source, (PurePosixPath, PureWindowsPath)) and self.source.is_absolute(),
+            "Rule.source must be an absolute path",
+        )
+        _require(isinstance(self.extensions, tuple), "Rule.extensions must be a tuple")
+        _require(self.name_glob is None or isinstance(self.name_glob, str), "Rule.name_glob must be a string or None")
+        _require(_is_int(self.min_age_s) and self.min_age_s >= 0, "Rule.min_age_s must be an int >= 0")
+        _require(isinstance(self.destination, DestinationTemplate), "Rule.destination must be a DestinationTemplate")
+
+
+@dataclass(frozen=True, slots=True)
+class Config:
+    version: int
+    flavor: Flavor
+    roots: tuple[AbsPath, ...]
+    timezone: Timezone
+    default_min_age_s: int
+    max_operations: int
+    exclude: tuple[str, ...]
+    rules: tuple[Rule, ...]
+    config_hash: str
+
+    def __post_init__(self) -> None:
+        _require(self.version == 1, "Config.version must be 1")
+        _require(isinstance(self.flavor, Flavor), "Config.flavor must be a Flavor")
+        _require(isinstance(self.timezone, Timezone), "Config.timezone must be a Timezone")
+        _require(len(self.roots) >= 1, "Config needs at least one root")
+        _require(len(self.rules) >= 1, "Config needs at least one rule")
+        _require(_is_int(self.default_min_age_s) and self.default_min_age_s >= 0, "Config.default_min_age_s must be >= 0")
+        _require(_is_int(self.max_operations) and 1 <= self.max_operations <= 100000, "Config.max_operations out of range")
+        _require(
+            isinstance(self.config_hash, str) and _SHA256_RE.fullmatch(self.config_hash) is not None,
+            "Config.config_hash must be 64 lowercase hex characters",
+        )
+        from marshalyard.canonical import compute_config_hash  # lazy: canonical imports models
+
+        expected = compute_config_hash(
+            version=self.version,
+            flavor=self.flavor,
+            roots=self.roots,
+            timezone=self.timezone,
+            default_min_age_s=self.default_min_age_s,
+            max_operations=self.max_operations,
+            exclude=self.exclude,
+            rules=self.rules,
+        )
+        _require(self.config_hash == expected, "Config.config_hash does not match its content")
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationResult:
+    config: Config | None
+    issues: tuple[Issue, ...]
+
+    def __post_init__(self) -> None:
+        has_error = any(issue.severity is Severity.ERROR for issue in self.issues)
+        _require((self.config is None) == has_error, "ValidationResult.config is None iff there is an error")

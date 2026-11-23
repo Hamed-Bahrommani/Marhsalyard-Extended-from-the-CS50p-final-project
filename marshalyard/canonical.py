@@ -3,11 +3,22 @@
 Step 2: portable_key and containing_root. compute_config_hash and
 compute_plan_id will be added to this module later.
 """
-
+import hashlib
+import json
 import unicodedata
 from collections.abc import Iterable
 
-from marshalyard.models import AbsPath
+from marshalyard.models import (
+    AbsPath,
+    DestinationTemplate,
+    ExtToken,
+    Flavor,
+    ModifiedToken,
+    Rule,
+    TextToken,
+    Timezone,
+)
+
 
 
 def _fold(component: str) -> str:
@@ -46,3 +57,65 @@ def containing_root(path: AbsPath, roots: Iterable[AbsPath]) -> AbsPath | None:
         if path.is_relative_to(root) and (best is None or len(root.parts) > len(best.parts)):
             best = root
     return best
+
+
+def _template_json(template: DestinationTemplate) -> dict:
+    components = []
+    for component in template.components:
+        tokens = []
+        for token in component:
+            if isinstance(token, TextToken):
+                tokens.append(["text", token.text])
+            elif isinstance(token, ExtToken):
+                tokens.append(["ext"])
+            elif isinstance(token, ModifiedToken):
+                tokens.append(["modified", token.fmt])
+            else:  # pragma: no cover - constructors prevent this
+                raise TypeError(f"unknown token {token!r}")
+        components.append(tokens)
+    return {"base": template.base.as_posix(), "components": components}
+
+
+def compute_config_hash(
+    *,
+    version: int,
+    flavor: Flavor,
+    roots: Iterable[AbsPath],
+    timezone: Timezone,
+    default_min_age_s: int,
+    max_operations: int,
+    exclude: Iterable[str],
+    rules: Iterable[Rule],
+) -> str:
+    """SHA-256 of a canonical JSON form of the configuration.
+
+    Order-invariant for roots, rules, extensions and exclusions; insensitive to
+    trailing separators (paths are already normalised); sensitive to spelling
+    (case, Unicode form) because those are real path differences.
+    """
+    payload = {
+        "schema": "marshalyard-config-1",
+        "version": version,
+        "flavor": flavor.value,
+        "timezone": timezone.value,
+        "default_min_age_s": default_min_age_s,
+        "max_operations": max_operations,
+        "roots": sorted(root.as_posix() for root in roots),
+        "exclude": sorted(set(exclude)),
+        "rules": sorted(
+            (
+                {
+                    "name": rule.name,
+                    "source": rule.source.as_posix(),
+                    "extensions": sorted(rule.extensions),
+                    "name_glob": rule.name_glob,
+                    "min_age_s": rule.min_age_s,
+                    "destination": _template_json(rule.destination),
+                }
+                for rule in rules
+            ),
+            key=lambda item: item["name"],
+        ),
+    }
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
