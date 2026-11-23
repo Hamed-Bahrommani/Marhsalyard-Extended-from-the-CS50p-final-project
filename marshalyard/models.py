@@ -250,3 +250,24 @@ class DestinationTemplate:
                 any(not isinstance(t, TextToken) for t in self.components[0]),
                 "the first variable component must contain a placeholder",
             )
+
+
+# ---------------------------------------------------------------- validation output
+
+
+@dataclass(frozen=True, slots=True)
+class Issue:
+    code: str
+    location: str
+    message: str
+    severity: Severity
+    line: int | None = None  # TOML_SYNTAX only, best-effort
+    column: int | None = None
+
+    def __post_init__(self) -> None:
+        _require(isinstance(self.code, str) and self.code != "", "Issue.code must be a non-empty string")
+        _require(isinstance(self.location, str) and self.location != "", "Issue.location must be a non-empty string")
+        _require(isinstance(self.message, str) and self.message != "", "Issue.message must be a non-empty string")
+        _require(isinstance(self.severity, Severity), "Issue.severity must be a Severity")
+        for value in (self.line, self.column):
+            _require(value is None or (_is_int(value) and value >= 1), "Issue.line/column must be None or >= 1")

@@ -8,6 +8,7 @@ import fnmatch
 import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath, PureWindowsPath
+import tomllib
 
 from marshalyard.models import (
     MODIFIED_FORMAT_RE,
@@ -18,6 +19,8 @@ from marshalyard.models import (
     ModifiedToken,
     TextToken,
     Token,
+    Issue,
+    Severity,
 )
 
 
@@ -320,3 +323,178 @@ def parse_template(raw: str, flavor: Flavor, home: AbsPath) -> DestinationTempla
         return DestinationTemplate(raw, path_type(split.anchor, *base_parts), ())
     base_parts = [tokens[0].text for tokens in parsed[:first]]
     return DestinationTemplate(raw, path_type(split.anchor, *base_parts), tuple(parsed[first:]))
+
+
+# ---------------------------------------------------------------- structure check (spec 5.1, S1-S3)
+
+MAX_ISSUES = 50
+MAX_RULES = 200
+SUPPORTED_VERSION = 1
+
+_TOP_KEYS = frozenset({"version", "settings", "rule"})
+_SETTINGS_KEYS = frozenset({"roots", "timezone", "min_age", "max_operations", "exclude"})
+_RULE_KEYS = frozenset({"name", "source", "extensions", "name_glob", "min_age", "destination"})
+_KIND_TEXT = {"string": "a string", "integer": "an integer", "strings": "an array of strings"}
+
+
+class _Sink:
+    """Collects issues; keeps the first MAX_ISSUES, then one TOO_MANY_ERRORS."""
+
+    def __init__(self) -> None:
+        self._issues: list[Issue] = []
+        self._overflow = False
+
+    def add(
+        self,
+        code: str,
+        location: str,
+        message: str,
+        severity: Severity = Severity.ERROR,
+        line: int | None = None,
+        column: int | None = None,
+    ) -> None:
+        if len(self._issues) >= MAX_ISSUES:
+            self._overflow = True
+            return
+        self._issues.append(Issue(code, location, message, severity, line, column))
+
+    def finish(self) -> tuple[Issue, ...]:
+        issues = list(self._issues)
+        if self._overflow:
+            issues.append(
+                Issue("TOO_MANY_ERRORS", "$", f"more than {MAX_ISSUES} issues; fix these first", Severity.ERROR)
+            )
+        return tuple(sorted(issues, key=lambda issue: (issue.location, issue.code)))
+
+
+def _is_plain_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _toml_type(value: object) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "table"
+    return "date or time"
+
+
+def _join(base: str, key: str) -> str:
+    return f"{base}.{key}" if base else key
+
+
+def _check_unknown(sink: _Sink, table: dict, allowed: frozenset[str], base: str) -> None:
+    for key in table:
+        if key not in allowed:
+            location = _join(base, key)
+            sink.add("UNKNOWN_KEY", location, f"unknown key '{location}'")
+
+
+def _check_field(sink: _Sink, table: dict, key: str, base: str, kind: str, required: bool = False) -> None:
+    location = _join(base, key)
+    if key not in table:
+        if required:
+            sink.add("MISSING_KEY", location, f"'{location}' is required")
+        return
+    value = table[key]
+    if kind == "string":
+        ok = isinstance(value, str)
+    elif kind == "integer":
+        ok = _is_plain_int(value)
+    else:
+        ok = isinstance(value, list)
+    if not ok:
+        sink.add("WRONG_TYPE", location, f"'{location}' must be {_KIND_TEXT[kind]}, got {_toml_type(value)}")
+        return
+    if kind == "strings":
+        for index, item in enumerate(value):
+            if not isinstance(item, str):
+                where = f"{location}[{index}]"
+                sink.add("WRONG_TYPE", where, f"'{where}' must be a string, got {_toml_type(item)}")
+
+
+def _check_settings(sink: _Sink, data: dict) -> None:
+    if "settings" not in data:
+        sink.add("MISSING_KEY", "settings", "the [settings] table is required")
+        return
+    settings = data["settings"]
+    if not isinstance(settings, dict):
+        sink.add("WRONG_TYPE", "settings", f"'settings' must be a table, got {_toml_type(settings)}")
+        return
+    _check_unknown(sink, settings, _SETTINGS_KEYS, "settings")
+    _check_field(sink, settings, "roots", "settings", "strings", required=True)
+    _check_field(sink, settings, "timezone", "settings", "string")
+    _check_field(sink, settings, "min_age", "settings", "string")
+    _check_field(sink, settings, "max_operations", "settings", "integer")
+    _check_field(sink, settings, "exclude", "settings", "strings")
+
+
+def _check_rules(sink: _Sink, data: dict) -> None:
+    if "rule" not in data:
+        sink.add("NO_RULES", "rule", "at least one [[rule]] is required")
+        return
+    rules = data["rule"]
+    if not isinstance(rules, list):
+        sink.add("WRONG_TYPE", "rule", f"'rule' must be an array of tables ([[rule]]), got {_toml_type(rules)}")
+        return
+    if not rules:
+        sink.add("NO_RULES", "rule", "at least one [[rule]] is required")
+        return
+    if len(rules) > MAX_RULES:
+        sink.add("TOO_MANY_RULES", "rule", f"at most {MAX_RULES} rules are allowed, found {len(rules)}")
+    for index, rule in enumerate(rules):
+        base = f"rule[{index}]"
+        if not isinstance(rule, dict):
+            sink.add("WRONG_TYPE", base, f"'{base}' must be a table, got {_toml_type(rule)}")
+            continue
+        _check_unknown(sink, rule, _RULE_KEYS, base)
+        _check_field(sink, rule, "name", base, "string", required=True)
+        _check_field(sink, rule, "source", base, "string", required=True)
+        _check_field(sink, rule, "destination", base, "string", required=True)
+        _check_field(sink, rule, "extensions", base, "strings")
+        _check_field(sink, rule, "name_glob", base, "string")
+        _check_field(sink, rule, "min_age", base, "string")
+
+
+def check_structure(text: str) -> tuple[Issue, ...]:
+    """TOML syntax, version, unknown keys, types and missing keys.
+
+    Stops after a syntax error or a bad/missing version; otherwise accumulates.
+    Values are not interpreted here (paths, durations, names: next step).
+    """
+    sink = _Sink()
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        line = getattr(exc, "lineno", None)
+        column = getattr(exc, "colno", None)
+        sink.add(
+            "TOML_SYNTAX",
+            "$",
+            str(exc) or "invalid TOML",
+            line=line if _is_plain_int(line) else None,
+            column=column if _is_plain_int(column) else None,
+        )
+        return sink.finish()
+
+    if "version" not in data:
+        sink.add("VERSION_MISSING", "version", "'version' is required; this tool supports version = 1")
+        return sink.finish()
+    version = data["version"]
+    if not _is_plain_int(version) or version != SUPPORTED_VERSION:
+        sink.add("VERSION_UNSUPPORTED", "version", f"unsupported version {version!r}; supported: {SUPPORTED_VERSION}")
+        return sink.finish()
+
+    _check_unknown(sink, data, _TOP_KEYS, "")
+    _check_settings(sink, data)
+    _check_rules(sink, data)
+    return sink.finish()
+
