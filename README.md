@@ -109,3 +109,8 @@ The specification is the source of truth. If the code and the spec disagree, the
 | M6 | Undo | Planned |
 | M7 | Command-line interface | Planned |
 | M8 | Documentation pass and release | Planned |
+
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -73,6 +73,7 @@ class SkipReason(_CodeEnum):
     NOT_REGULAR = auto()
     HIDDEN_OR_SYSTEM = auto()
     RUNTIME_FILE = auto()
+    UNREADABLE = auto()
 
 
 class Observation(_CodeEnum):
