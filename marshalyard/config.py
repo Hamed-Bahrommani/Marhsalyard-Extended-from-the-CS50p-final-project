@@ -6,8 +6,9 @@ parse_config turns each FieldError into an Issue with a TOML location.
 
 import fnmatch
 import re
+import os
 from dataclasses import dataclass
-from pathlib import PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import tomllib
 
 from marshalyard.canonical import compute_config_hash, containing_root
@@ -847,3 +848,36 @@ def parse_config(text: str, flavor: Flavor, home: AbsPath) -> ValidationResult:
     )
     return ValidationResult(config, issues)
 
+# ---------------------------------------------------------------- file loading (S0)
+
+MAX_CONFIG_BYTES = 1024 * 1024
+
+
+def host_flavor() -> Flavor:
+    return Flavor.WINDOWS if os.name == "nt" else Flavor.POSIX
+
+
+def _file_issue(code: str, message: str) -> ValidationResult:
+    return ValidationResult(None, (Issue(code, "$", message, Severity.ERROR),))
+
+
+def load_config(path, flavor: Flavor | None = None, home: AbsPath | None = None) -> ValidationResult:
+    """Thin, impure wrapper: read the file, then hand its text to parse_config."""
+    flavor = flavor or host_flavor()
+    if home is None:
+        path_type = PureWindowsPath if flavor is Flavor.WINDOWS else PurePosixPath
+        home = path_type(str(Path.home()))
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(MAX_CONFIG_BYTES + 1)
+    except FileNotFoundError:
+        return _file_issue("CONFIG_NOT_FOUND", f"configuration file not found: {path}")
+    except OSError as exc:
+        return _file_issue("CONFIG_UNREADABLE", f"cannot read {path}: {exc.strerror or exc}")
+    if len(data) > MAX_CONFIG_BYTES:
+        return _file_issue("CONFIG_TOO_LARGE", f"configuration file is larger than {MAX_CONFIG_BYTES} bytes")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return _file_issue("CONFIG_NOT_UTF8", "configuration file is not valid UTF-8")
+    return parse_config(text, flavor, home)

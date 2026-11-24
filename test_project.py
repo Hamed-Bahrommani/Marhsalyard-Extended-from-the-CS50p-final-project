@@ -1,4 +1,6 @@
-from project import find_root, main, names_collide, version_string
+from project import find_root, main, names_collide, version_string, load_rules
+import pytest
+
 
 def test_version_string():
     assert version_string().startswith("marshalyard ")
@@ -39,3 +41,30 @@ def test_find_root_returns_none_outside_every_root():
 def test_find_root_windows_is_case_insensitive():
     roots = ["C:\\Users\\X\\Downloads"]
     assert find_root("c:\\users\\x\\downloads\\a.pdf", roots, windows=True) == "C:\\Users\\X\\Downloads"
+
+def _write_config(tmp_path, version="1"):
+    inbox = tmp_path / "in"
+    out = tmp_path / "out"
+    text = (
+        f"version = {version}\n[settings]\nroots = ['{inbox}', '{out}']\n"
+        f"[[rule]]\nname = 'pdfs'\nsource = '{inbox}'\nextensions = ['pdf']\n"
+        f"destination = '{out}/{{ext}}'\n"
+    )
+    path = tmp_path / "marshal.toml"
+    path.write_text(text, encoding="utf-8")
+    return str(path)
+
+
+def test_load_rules_returns_rule_names(tmp_path):
+    assert load_rules(_write_config(tmp_path)) == ["pdfs"]
+
+
+def test_load_rules_rejects_an_invalid_file(tmp_path):
+    with pytest.raises(ValueError, match="VERSION_UNSUPPORTED"):
+        load_rules(_write_config(tmp_path, version="2"))
+
+
+def test_load_rules_reports_a_missing_file(tmp_path):
+    with pytest.raises(ValueError, match="CONFIG_NOT_FOUND"):
+        load_rules(str(tmp_path / "missing.toml"))
+

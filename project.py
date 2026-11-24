@@ -10,7 +10,22 @@ from pathlib import PurePosixPath, PureWindowsPath
 from marshalyard.canonical import containing_root, portable_key
 
 from marshalyard import __version__
-from marshalyard.canonical import portable_key
+
+from marshalyard.config import load_config
+from marshalyard.models import Severity
+
+
+def load_rules(path: str) -> list[str]:
+    """Names of the rules in a valid configuration file.
+
+    Raises ValueError, listing every error, if the file is missing or invalid.
+    """
+    result = load_config(path)
+    if result.config is None:
+        errors = [f"{i.location}: {i.code}" for i in result.issues if i.severity is Severity.ERROR]
+        raise ValueError("invalid configuration: " + "; ".join(errors))
+    return [rule.name for rule in result.config.rules]
+
 
 def find_root(path: str, roots: list[str], windows: bool = False) -> str | None:
     """Return the most specific root (as a string) that contains `path`, or None.
