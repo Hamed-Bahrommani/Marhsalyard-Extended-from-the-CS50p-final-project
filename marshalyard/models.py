@@ -540,3 +540,74 @@ class Run:
             _require(self.recovered_at_ns >= self.started_at_ns, "recovered_at_ns cannot precede started_at_ns")
         if self.finished_at_ns is not None:
             _require(self.finished_at_ns >= self.started_at_ns, "finished_at_ns cannot precede started_at_ns")
+
+# ---------------------------------------------------------------- scanning
+
+
+@dataclass(frozen=True, slots=True)
+class FileEntry:
+    """A regular file seen by the scanner. dev/ino == 0 or nlink == 0 mean
+    'unavailable': representable here, never plannable."""
+
+    path: AbsPath
+    size: int
+    mtime_ns: int
+    dev: int
+    ino: int
+    nlink: int
+
+    def __post_init__(self) -> None:
+        _require(
+            isinstance(self.path, (PurePosixPath, PureWindowsPath)) and self.path.is_absolute(),
+            "FileEntry.path must be an absolute path",
+        )
+        _require(_is_int(self.size) and self.size >= 0, "FileEntry.size must be an int >= 0")
+        _require(_is_int(self.mtime_ns), "FileEntry.mtime_ns must be an int")
+        _require(_is_int(self.dev) and self.dev >= 0, "FileEntry.dev must be an int >= 0")
+        _require(_is_int(self.ino) and self.ino >= 0, "FileEntry.ino must be an int >= 0")
+        _require(_is_int(self.nlink) and self.nlink >= 0, "FileEntry.nlink must be an int >= 0")
+
+
+@dataclass(frozen=True, slots=True)
+class SkippedEntry:
+    path: AbsPath
+    reason: SkipReason
+
+    def __post_init__(self) -> None:
+        _require(
+            isinstance(self.path, (PurePosixPath, PureWindowsPath)) and self.path.is_absolute(),
+            "SkippedEntry.path must be an absolute path",
+        )
+        _require(isinstance(self.reason, SkipReason), "SkippedEntry.reason must be a SkipReason")
+
+
+@dataclass(frozen=True, slots=True)
+class Snapshot:
+    taken_at_ns: int
+    sources: tuple[AbsPath, ...]
+    entries: tuple[FileEntry, ...]
+    skipped: tuple[SkippedEntry, ...]
+
+    def __post_init__(self) -> None:
+        _require(_is_int(self.taken_at_ns) and self.taken_at_ns >= 0, "Snapshot.taken_at_ns must be an int >= 0")
+        _require(
+            isinstance(self.sources, tuple) and isinstance(self.entries, tuple) and isinstance(self.skipped, tuple),
+            "Snapshot sources, entries and skipped must be tuples",
+        )
+        entry_paths = [entry.path for entry in self.entries]
+        skipped_paths = [item.path for item in self.skipped]
+        every_path = list(self.sources) + entry_paths + skipped_paths
+        if every_path:
+            _require(_paths_share_flavor(every_path), "all paths in a Snapshot must be of one pure-path class")
+            _require(all(p.is_absolute() for p in every_path), "all paths in a Snapshot must be absolute")
+
+        _require(len(set(self.sources)) == len(self.sources), "Snapshot sources must be unique")
+        for label, paths in (("entries", entry_paths), ("skipped", skipped_paths)):
+            keys = [p.as_posix() for p in paths]
+            _require(keys == sorted(keys), f"Snapshot {label} must be sorted by as_posix()")
+            _require(len(set(paths)) == len(paths), f"Snapshot {label} must be unique")
+        _require(not (set(entry_paths) & set(skipped_paths)), "Snapshot skipped entries must be disjoint from entries")
+
+        source_set = set(self.sources)
+        for path in entry_paths + skipped_paths:
+            _require(path.parent in source_set, f"the parent of {path} is not one of the Snapshot sources")
