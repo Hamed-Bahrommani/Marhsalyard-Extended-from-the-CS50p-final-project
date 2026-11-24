@@ -6,7 +6,7 @@ compute_plan_id will be added to this module later.
 import hashlib
 import json
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 from marshalyard.models import (
     AbsPath,
@@ -17,6 +17,9 @@ from marshalyard.models import (
     Rule,
     TextToken,
     Timezone,
+    PlanKind,
+    PlannedOperation,
+    Unplanned,
 )
 
 
@@ -116,6 +119,50 @@ def compute_config_hash(
             ),
             key=lambda item: item["name"],
         ),
+    }
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def compute_plan_id(
+    *,
+    kind: PlanKind,
+    config_hash: str | None,
+    derived_from_run: int | None,
+    operations: Sequence[PlannedOperation],
+    unplanned: Sequence[Unplanned],
+) -> str:
+    """SHA-256 of the canonical JSON of the whole immutable proposal.
+
+    created_at_ns is the only field excluded. Unplanned entries are sorted so
+    their discovery order never changes the id.
+    """
+    payload = {
+        "kind": kind.value,
+        "config_hash": config_hash,
+        "derived_from_run": derived_from_run,
+        "ops": [
+            {
+                "seq": op.seq,
+                "src": op.src.as_posix(),
+                "dst": op.dst.as_posix(),
+                "rule": op.rule_name,
+                "fp": {
+                    "dev": op.fingerprint.dev,
+                    "ino": op.fingerprint.ino,
+                    "nlink": op.fingerprint.nlink,
+                    "size": op.fingerprint.size,
+                    "mtime_ns": op.fingerprint.mtime_ns,
+                    "sha256": op.fingerprint.sha256,
+                    "method": op.fingerprint.method.value,
+                },
+            }
+            for op in operations
+        ],
+        "unplanned": [
+            {"src": item.src.as_posix(), "reason": item.reason.value, "detail": item.detail}
+            for item in sorted(unplanned, key=lambda u: (u.src.as_posix(), u.reason.value))
+        ],
     }
     text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()

@@ -345,3 +345,103 @@ class ValidationResult:
     def __post_init__(self) -> None:
         has_error = any(issue.severity is Severity.ERROR for issue in self.issues)
         _require((self.config is None) == has_error, "ValidationResult.config is None iff there is an error")
+
+
+# ---------------------------------------------------------------- plans
+
+
+def _paths_share_flavor(paths) -> bool:
+    classes = {type(path) for path in paths}
+    return len(classes) == 1 and next(iter(classes)) in (PurePosixPath, PureWindowsPath)
+
+
+@dataclass(frozen=True, slots=True)
+class PlannedOperation:
+    seq: int
+    src: AbsPath
+    dst: AbsPath
+    rule_name: str
+    fingerprint: Fingerprint
+
+    def __post_init__(self) -> None:
+        _require(_is_int(self.seq) and self.seq >= 1, "PlannedOperation.seq must be an int >= 1")
+        _require(_paths_share_flavor((self.src, self.dst)), "PlannedOperation paths must be of one pure-path class")
+        _require(self.src.is_absolute() and self.dst.is_absolute(), "PlannedOperation paths must be absolute")
+        _require(self.dst != self.src, "PlannedOperation.dst must differ from src")
+        _require(isinstance(self.rule_name, str) and self.rule_name != "", "PlannedOperation.rule_name must be non-empty")
+        _require(isinstance(self.fingerprint, Fingerprint), "PlannedOperation.fingerprint must be a Fingerprint")
+        _require(self.fingerprint.nlink == 1, "PlannedOperation.fingerprint.nlink must be 1")
+
+
+@dataclass(frozen=True, slots=True)
+class Unplanned:
+    src: AbsPath
+    reason: UnplannedReason
+    detail: str = ""
+
+    def __post_init__(self) -> None:
+        _require(
+            isinstance(self.src, (PurePosixPath, PureWindowsPath)) and self.src.is_absolute(),
+            "Unplanned.src must be an absolute path",
+        )
+        _require(isinstance(self.reason, UnplannedReason), "Unplanned.reason must be an UnplannedReason")
+        _require(isinstance(self.detail, str), "Unplanned.detail must be a string")
+
+
+@dataclass(frozen=True, slots=True)
+class Plan:
+    plan_id: str
+    kind: PlanKind
+    config_hash: str | None  # None iff kind == UNDO
+    created_at_ns: int
+    derived_from_run: int | None  # set iff kind == UNDO
+    operations: tuple[PlannedOperation, ...]
+    unplanned: tuple[Unplanned, ...]
+
+    def __post_init__(self) -> None:
+        _require(isinstance(self.kind, PlanKind), "Plan.kind must be a PlanKind")
+        _require(_is_int(self.created_at_ns) and self.created_at_ns >= 0, "Plan.created_at_ns must be an int >= 0")
+        _require(isinstance(self.operations, tuple) and len(self.operations) >= 1, "a Plan needs at least one operation")
+        _require(isinstance(self.unplanned, tuple), "Plan.unplanned must be a tuple")
+
+        is_undo = self.kind is PlanKind.UNDO
+        _require((self.derived_from_run is not None) == is_undo, "derived_from_run is set iff the plan is an undo")
+        _require((self.config_hash is None) == is_undo, "config_hash is None iff the plan is an undo")
+        if self.derived_from_run is not None:
+            _require(_is_int(self.derived_from_run) and self.derived_from_run >= 1, "derived_from_run must be >= 1")
+        if self.config_hash is not None:
+            _require(
+                isinstance(self.config_hash, str) and _SHA256_RE.fullmatch(self.config_hash) is not None,
+                "Plan.config_hash must be 64 lowercase hex characters",
+            )
+
+        all_paths = [p for op in self.operations for p in (op.src, op.dst)] + [u.src for u in self.unplanned]
+        _require(_paths_share_flavor(all_paths), "all paths in a Plan must be of one pure-path class")
+
+        _require(
+            [op.seq for op in self.operations] == list(range(1, len(self.operations) + 1)),
+            "operation seq must run 1..N in order",
+        )
+        for op in self.operations:
+            _require((op.rule_name == UNDO_RULE) == is_undo, "rule_name is the undo marker iff the plan is an undo")
+
+        sources = [op.src for op in self.operations]
+        _require(len(set(sources)) == len(sources), "operation sources must be unique")
+
+        from marshalyard.canonical import compute_plan_id, portable_key  # lazy: canonical imports models
+
+        keys = [portable_key(op.dst) for op in self.operations]
+        _require(len(set(keys)) == len(keys), "operation destinations must be unique (portable_key collision)")
+
+        unplanned_sources = [u.src for u in self.unplanned]
+        _require(len(set(unplanned_sources)) == len(unplanned_sources), "unplanned sources must be unique")
+        _require(not (set(unplanned_sources) & set(sources)), "an unplanned source cannot also be planned")
+
+        expected = compute_plan_id(
+            kind=self.kind,
+            config_hash=self.config_hash,
+            derived_from_run=self.derived_from_run,
+            operations=self.operations,
+            unplanned=self.unplanned,
+        )
+        _require(self.plan_id == expected, "Plan.plan_id does not match its content")
