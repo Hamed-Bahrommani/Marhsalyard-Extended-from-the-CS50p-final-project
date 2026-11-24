@@ -445,3 +445,98 @@ class Plan:
             unplanned=self.unplanned,
         )
         _require(self.plan_id == expected, "Plan.plan_id does not match its content")
+
+
+# ---------------------------------------------------------------- journal records
+
+
+def _is_timestamp_or_none(value: object) -> bool:
+    return value is None or (_is_int(value) and value >= 0)
+
+
+@dataclass(frozen=True, slots=True)
+class OperationRecord:
+    run_id: int
+    seq: int
+    state: OpState
+    cause: TransitionCause | None  # cause of the transition into `state`; None iff PENDING
+    reason: RecordReason | None
+    attempted_at_ns: int | None = None
+    finished_at_ns: int | None = None
+
+    def __post_init__(self) -> None:
+        _require(_is_int(self.run_id) and self.run_id >= 1, "OperationRecord.run_id must be an int >= 1")
+        _require(_is_int(self.seq) and self.seq >= 1, "OperationRecord.seq must be an int >= 1")
+        _require(isinstance(self.state, OpState), "OperationRecord.state must be an OpState")
+        _require(
+            _is_timestamp_or_none(self.attempted_at_ns) and _is_timestamp_or_none(self.finished_at_ns),
+            "OperationRecord timestamps must be None or ints >= 0",
+        )
+        _require(self.cause is None or isinstance(self.cause, TransitionCause), "OperationRecord.cause is invalid")
+        _require(self.reason is None or isinstance(self.reason, RecordReason), "OperationRecord.reason is invalid")
+
+        if self.state is OpState.PENDING:
+            _require(
+                self.cause is None
+                and self.reason is None
+                and self.attempted_at_ns is None
+                and self.finished_at_ns is None,
+                "a PENDING record has no cause, reason or timestamps",
+            )
+        elif self.state is OpState.ATTEMPTING:
+            _require(self.cause is TransitionCause.EXECUTION, "an ATTEMPTING record has cause EXECUTION")
+            _require(self.reason is None, "an ATTEMPTING record has no reason")
+            _require(self.attempted_at_ns is not None, "an ATTEMPTING record needs attempted_at_ns")
+            _require(self.finished_at_ns is None, "an ATTEMPTING record has no finished_at_ns")
+        else:
+            _require(self.cause is not None, "a terminal record needs a cause")
+            _require(self.finished_at_ns is not None, "a terminal record needs finished_at_ns")
+            if self.state is OpState.DONE:
+                _require(
+                    self.reason in (None, RecordReason.RECOVERED, RecordReason.RECOVERED_METADATA_ONLY),
+                    "a DONE record's reason is None, RECOVERED or RECOVERED_METADATA_ONLY",
+                )
+            else:
+                _require(self.reason is not None, "FAILED, SKIPPED and UNRESOLVED records need a reason")
+
+        if self.attempted_at_ns is not None and self.finished_at_ns is not None:
+            _require(self.finished_at_ns >= self.attempted_at_ns, "finished_at_ns cannot precede attempted_at_ns")
+
+
+@dataclass(frozen=True, slots=True)
+class Run:
+    run_id: int
+    plan_id: str
+    state: RunState
+    started_at_ns: int
+    finished_at_ns: int | None
+    recovered_at_ns: int | None
+    abort_reason: str | None
+
+    def __post_init__(self) -> None:
+        _require(_is_int(self.run_id) and self.run_id >= 1, "Run.run_id must be an int >= 1")
+        _require(
+            isinstance(self.plan_id, str) and _SHA256_RE.fullmatch(self.plan_id) is not None,
+            "Run.plan_id must be 64 lowercase hex characters",
+        )
+        _require(isinstance(self.state, RunState), "Run.state must be a RunState")
+        _require(_is_int(self.started_at_ns) and self.started_at_ns >= 0, "Run.started_at_ns must be an int >= 0")
+        _require(
+            _is_timestamp_or_none(self.finished_at_ns) and _is_timestamp_or_none(self.recovered_at_ns),
+            "Run timestamps must be None or ints >= 0",
+        )
+        _require(
+            (self.finished_at_ns is None) == (self.state is RunState.RUNNING),
+            "finished_at_ns is None iff the run is RUNNING",
+        )
+        _require(
+            (self.abort_reason is not None) == (self.state is RunState.ABORTED),
+            "abort_reason is set iff the run is ABORTED",
+        )
+        if self.abort_reason is not None:
+            _require(isinstance(self.abort_reason, str) and self.abort_reason != "", "abort_reason must be non-empty")
+        if self.recovered_at_ns is not None:
+            _require(self.state is RunState.FINISHED, "recovered_at_ns is only set on a FINISHED run")
+            _require(self.recovered_at_ns >= self.started_at_ns, "recovered_at_ns cannot precede started_at_ns")
+        if self.finished_at_ns is not None:
+            _require(self.finished_at_ns >= self.started_at_ns, "finished_at_ns cannot precede started_at_ns")
