@@ -102,7 +102,7 @@ The specification is the source of truth. If the code and the spec disagree, the
 | Milestone | Scope | Status |
 |---|---|---|
 | M1 | Domain model, TOML configuration and validation, canonical hashing, state transitions | Done |
-| M2 | Filesystem port, in-memory fake with fault and race injection, scanner, matching, planner | In progress |
+| M2 | Filesystem port, in-memory fake with fault and race injection, scanner, matching, planner | Done |
 | M3 | Real filesystem, fingerprinting, no-replace move strategies, Windows verification | Planned |
 | M4 | SQLite journal, executor, preflight, locking | Planned |
 | M5 | Recovery and exhaustive fault-injection tests | Planned |
