@@ -77,3 +77,16 @@ class FileSystem(Protocol):
 
     def realpath(self, path: AbsPath) -> AbsPath:
         """The path with every link resolved."""
+    
+    def move_no_clobber(self, src: AbsPath, dst: AbsPath) -> None: ...
+
+class SourceMissing(FsError):
+    """move_no_clobber: the source is not there."""
+
+
+class DestinationExists(FsError):
+    """move_no_clobber: something already occupies the destination; nothing was moved."""
+
+
+class NoReplaceUnsupported(FsError):
+    """move_no_clobber: this platform or filesystem cannot guarantee a no-replace rename."""

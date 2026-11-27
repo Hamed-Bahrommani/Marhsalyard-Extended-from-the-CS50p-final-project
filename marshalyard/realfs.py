@@ -4,11 +4,22 @@ Stat values come from fresh no-follow os.lstat calls; DirEntry data is never use
 (on Windows it reports zero identity). Files are opened without following links.
 """
 
+import ctypes
+import errno
+import functools
 import os
 import stat
+import sys
 from pathlib import PurePosixPath, PureWindowsPath
 
-from marshalyard.filesystem import FileKind, FsError, StatInfo
+from marshalyard.filesystem import (
+    DestinationExists,
+    FileKind,
+    FsError,
+    NoReplaceUnsupported,
+    SourceMissing,
+    StatInfo,
+)
 from marshalyard.models import AbsPath, Flavor
 
 _O_BINARY = getattr(os, "O_BINARY", 0)
@@ -44,6 +55,44 @@ def _stat_info(st: os.stat_result) -> StatInfo:
 
 def _reason(exc: BaseException) -> str:
     return getattr(exc, "strerror", None) or type(exc).__name__
+
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+
+
+@functools.lru_cache(maxsize=1)
+def _renameat2():
+    """The C library's renameat2, or None. There is deliberately no fallback."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        function = ctypes.CDLL(None, use_errno=True).renameat2
+    except (OSError, AttributeError):
+        return None
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    return function
+
+
+def _native_rename(src: str, dst: str) -> None:
+    """Atomic rename that never replaces an existing destination, or raise.
+
+    FileExistsError: the destination exists. NotImplementedError: the platform or
+    filesystem cannot guarantee no-replace. OSError: anything else.
+    """
+    if os.name == "nt":
+        os.rename(src, dst)  # MoveFileEx without REPLACE_EXISTING: fails if dst exists
+        return
+    function = _renameat2()
+    if function is None:
+        raise NotImplementedError("no atomic no-replace rename is available on this platform")
+    ctypes.set_errno(0)
+    if function(_AT_FDCWD, os.fsencode(src), _AT_FDCWD, os.fsencode(dst), _RENAME_NOREPLACE) == 0:
+        return
+    code = ctypes.get_errno()
+    if code in (errno.EINVAL, errno.ENOSYS):
+        raise NotImplementedError("this filesystem does not support RENAME_NOREPLACE")
+    raise OSError(code, os.strerror(code))  # EEXIST becomes FileExistsError automatically
 
 
 class _RealHandle:
@@ -146,3 +195,33 @@ class RealFileSystem:
             return self._path_type(os.path.realpath(str(path)))
         except (OSError, ValueError) as exc:
             raise FsError(path, _reason(exc)) from None
+
+    def move_no_clobber(self, src: AbsPath, dst: AbsPath) -> None:
+        self._check(src)
+        self._check(dst)
+        source = self.lstat(src)
+        if source is None:
+            raise SourceMissing(src, "no such file")
+        if source.kind is FileKind.SYMLINK or source.reparse_point:
+            raise FsError(src, "refusing to move a symlink")
+        if source.kind is not FileKind.FILE:
+            raise FsError(src, "not a regular file")
+        # Also stops a Windows case-only "rename" of the same file, which os.rename would allow.
+        if self.lstat(dst) is not None:
+            raise DestinationExists(dst, "destination already exists")
+        try:
+            _native_rename(str(src), str(dst))  # the atomic step: this is the real guarantee
+        except NotImplementedError as exc:
+            raise NoReplaceUnsupported(dst, str(exc)) from None
+        except FileExistsError:
+            raise DestinationExists(dst, "destination already exists") from None
+        except FileNotFoundError:
+            if self.lstat(src) is None:
+                raise SourceMissing(src, "the source disappeared") from None
+            raise FsError(dst, "destination directory does not exist") from None
+        except OSError as exc:
+            if exc.errno == errno.EXDEV:
+                raise FsError(dst, "source and destination are on different devices") from None
+            if self.lstat(dst) is not None:
+                raise DestinationExists(dst, "destination already exists") from None
+            raise FsError(dst, _reason(exc)) from None

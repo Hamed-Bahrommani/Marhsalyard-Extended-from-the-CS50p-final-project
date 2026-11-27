@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath, PureWindowsPath
 
-from marshalyard.filesystem import FileKind, FsError, StatInfo
+from marshalyard.filesystem import DestinationExists, FileKind, FsError, SourceMissing, StatInfo
 from marshalyard.models import AbsPath, Flavor
 
 MAX_LINK_DEPTH = 40
@@ -37,6 +37,7 @@ class _Handle:
         self._node = node
         self._pos = 0
         self._closed = False
+        self.mutations: list[tuple[str, AbsPath, AbsPath]] = []  # successful changes only
 
     def _live(self) -> None:
         if self._closed:
@@ -70,6 +71,7 @@ class MemoryFileSystem:
         self.default_mtime_ns = default_mtime_ns
         self.calls: list[tuple[str, AbsPath]] = []
         self._hooks: list[list] = []
+        self.mutations: list[tuple[str, AbsPath, AbsPath]] = []  # successful changes only
 
     # ------------------------------------------------------------ port
 
@@ -109,6 +111,32 @@ class MemoryFileSystem:
         self._check(path)
         self._enter("realpath", path)
         return self._real(path, 0)
+
+    def move_no_clobber(self, src: AbsPath, dst: AbsPath) -> None:
+        self._check(src)
+        self._check(dst)
+        self._enter("move_no_clobber", src)
+        node = self._resolve(src, follow_final=False)
+        if node is None:
+            raise SourceMissing(src, "no such file")
+        if node.kind is FileKind.SYMLINK or node.reparse_point:
+            raise FsError(src, "refusing to move a symlink")
+        if node.kind is not FileKind.FILE:
+            raise FsError(src, "not a regular file")
+        if len(dst.parts) < 2:
+            raise FsError(dst, "cannot move onto a root")
+        target_dir = self._resolve(dst.parent, follow_final=True)
+        if target_dir is None or target_dir.kind is not FileKind.DIRECTORY:
+            raise FsError(dst, "destination directory does not exist")
+        key = self._key(dst.parts[-1])
+        if key in target_dir.children:
+            raise DestinationExists(dst, "destination already exists")
+        if target_dir.dev != node.dev:
+            raise FsError(dst, "source and destination are on different devices")
+        source_dir = self._resolve(src.parent, follow_final=True)
+        del source_dir.children[self._key(src.parts[-1])]
+        target_dir.children[key] = (dst.parts[-1], node)  # same node: identity, mtime, nlink kept
+        self.mutations.append(("move", src, dst))
 
     # ------------------------------------------------------------ fault and race injection
 

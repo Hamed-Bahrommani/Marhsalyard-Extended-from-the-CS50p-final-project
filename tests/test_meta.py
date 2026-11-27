@@ -126,10 +126,16 @@ def test_no_module_uses_typing_literal():
         assert not re.search(r"\bLiteral\b", path.read_text(encoding="utf-8")), path.name
 
 
-def test_pure_modules_import_no_io_libraries():
-    pattern = re.compile(r"^\s*(?:import|from)\s+(?:sqlite3|ctypes|subprocess)\b", re.MULTILINE)
+IO_ALLOWED = {
+    "realfs.py": {"ctypes"},
+}
+
+
+def test_io_libraries_are_confined_to_the_modules_that_need_them():
+    pattern = re.compile(r"^\s*(?:import|from)\s+(sqlite3|ctypes|subprocess)\b", re.MULTILINE)
     for path in PACKAGE_DIR.glob("*.py"):
-        assert not pattern.search(path.read_text(encoding="utf-8")), path.name
+        used = set(pattern.findall(path.read_text(encoding="utf-8")))
+        assert used <= IO_ALLOWED.get(path.name, set()), (path.name, sorted(used))
 
 
 def test_parse_config_never_touches_the_filesystem(monkeypatch):
